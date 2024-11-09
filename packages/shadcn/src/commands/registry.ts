@@ -1,6 +1,6 @@
+import { promises as fs } from "fs"
 import path from "path"
 import { Command } from "commander"
-import fs from "fs-extra"
 import prompts from "prompts"
 import { z } from "zod"
 
@@ -8,6 +8,7 @@ import { RawConfig, getRawConfig, rawConfigSchema } from "../utils/get-config"
 import { handleError } from "../utils/handle-error"
 import { highlighter } from "../utils/highlighter"
 import { logger } from "../utils/logger"
+import { buildRegistry } from "../utils/registry/build"
 import { spinner } from "../utils/spinner"
 
 async function updateComponentsJson(cwd: string, config: RawConfig) {
@@ -135,8 +136,37 @@ const removeRegistry = new Command()
       handleError(error)
     }
   })
+
+export const buildOptionsSchema = z.object({
+  cwd: z.string(),
+  output: z.string(),
+})
+const build = new Command()
+  .name("build")
+  .argument("output", "output directory")
+  .option(
+    "-c, --cwd <cwd>",
+    "the working directory. defaults to the current directory.",
+    process.cwd()
+  )
+  .action(async (output, opts) => {
+    try {
+      const options = buildOptionsSchema.parse({
+        output,
+        ...opts,
+      })
+      const cwd = path.resolve(options.cwd)
+      const outputDir = path.resolve(options.output)
+      await buildRegistry({ cwd, outputDir })
+    } catch (error) {
+      logger.break()
+      handleError(error)
+    }
+  })
+
 export const registry = new Command()
   .name("registry")
   .description("manage external registries")
   .addCommand(addRegistry)
   .addCommand(removeRegistry)
+  .addCommand(build)
