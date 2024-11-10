@@ -17,7 +17,7 @@ export type TransformOpts = {
   filename: string
   raw: string
   config: Config
-  baseColor?: z.infer<typeof registryBaseColorSchema>
+  inlineColors?: z.infer<typeof registryBaseColorSchema>["inlineColors"]
   transformJsx?: boolean
 }
 

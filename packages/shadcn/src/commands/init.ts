@@ -267,6 +267,7 @@ async function promptForConfig(defaultConfig: Config | null = null) {
 
   return rawConfigSchema.parse({
     $schema: "https://ui.shadcn.com/schema.json",
+    url: registry,
     style: options.style,
     tailwind: {
       config: options.tailwindConfig,
@@ -294,25 +295,34 @@ async function promptForMinimalConfig(
   let style = defaultConfig.style
   let baseColor = defaultConfig.tailwind.baseColor
   let cssVariables = defaultConfig.tailwind.cssVariables
+  let registry = undefined
 
   if (!opts.defaults) {
-    const registry = await promptForRegistry()
+    registry = await promptForRegistry()
+
     const [styles, baseColors] = await Promise.all([
       getRegistryStyles(registry),
       getRegistryBaseColors(),
     ])
 
+    style = styles[0].name
+    if (styles.length > 1) {
+      const styleOptions = await prompts([
+        {
+          type: "select",
+          name: "style",
+          message: `Which ${highlighter.info("style")} would you like to use?`,
+          choices: styles.map((style) => ({
+            title: style.label,
+            value: style.name,
+          })),
+          initial: styles.findIndex((s) => s.name === defaultConfig.style),
+        },
+      ])
+      style = styleOptions.style
+    }
+
     const options = await prompts([
-      {
-        type: "select",
-        name: "style",
-        message: `Which ${highlighter.info("style")} would you like to use?`,
-        choices: styles.map((style) => ({
-          title: style.label,
-          value: style.name,
-        })),
-        initial: styles.findIndex((s) => s.name === style),
-      },
       {
         type: "select",
         name: "tailwindBaseColor",
@@ -336,13 +346,13 @@ async function promptForMinimalConfig(
       },
     ])
 
-    style = options.style
     baseColor = options.tailwindBaseColor
     cssVariables = options.tailwindCssVariables
   }
 
   return rawConfigSchema.parse({
     $schema: defaultConfig?.$schema,
+    url: registry,
     style,
     tailwind: {
       ...defaultConfig?.tailwind,

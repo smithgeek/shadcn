@@ -151,10 +151,9 @@ async function diffComponent(
   config: Config
 ) {
   const payload = await fetchTree(config, [component])
-  const baseColor = await getRegistryBaseColor(
-    config.tailwind.baseColor,
-    config.url
-  )
+  const baseColor = config.tailwind.cssVariables
+    ? null
+    : await getRegistryBaseColor(config.tailwind.baseColor, config.url)
 
   if (!payload) {
     return []
@@ -189,7 +188,7 @@ async function diffComponent(
         filename: file.path,
         raw: file.content,
         config,
-        baseColor,
+        inlineColors: baseColor?.inlineColors,
       })
 
       const patch = diffLines(registryContent as string, fileContent)

@@ -178,11 +178,18 @@ export async function getItemTargetPath(
   )
 }
 
+const fetchCache: Record<string, object> = {}
+
 async function fetchRegistry(paths: string[], registryUrl: string) {
   try {
     const results = await Promise.all(
       paths.map(async (path) => {
         const url = getRegistryUrl(path, registryUrl)
+        if (url in fetchCache) {
+          logger.verbose(`Using cached ${highlighter.info(url)}`)
+          return fetchCache[url]
+        }
+        logger.debug(`Fetching ${highlighter.info(url)}`)
         const response = await fetch(url, { agent })
 
         if (!response.ok) {
@@ -228,7 +235,9 @@ async function fetchRegistry(paths: string[], registryUrl: string) {
           )
         }
 
-        return response.json()
+        const data = response.json()
+        fetchCache[url] = data
+        return data
       })
     )
 
@@ -419,28 +428,24 @@ export async function registryGetTheme(name: string, config: Config) {
         },
       },
     },
-    cssVars: {
-      light: {
-        radius: "0.5rem",
-      },
-      dark: {},
-    },
+    cssVars: baseColor.cssVars,
   } satisfies z.infer<typeof registryItemSchema>
 
   if (config.tailwind.cssVariables) {
     theme.tailwind.config.theme.extend.colors = {
       ...theme.tailwind.config.theme.extend.colors,
-      ...buildTailwindThemeColorsFromCssVars(baseColor.cssVars.dark),
+      ...Object.assign(
+        {},
+        ...Object.keys(baseColor.cssVars).map((themeName) =>
+          buildTailwindThemeColorsFromCssVars(baseColor.cssVars[themeName])
+        )
+      ),
     }
-    theme.cssVars = {
-      light: {
-        ...baseColor.cssVars.light,
-        ...theme.cssVars.light,
-      },
-      dark: {
-        ...baseColor.cssVars.dark,
-        ...theme.cssVars.dark,
-      },
+
+    for (const themeName of Object.keys(baseColor.cssVars)) {
+      if (!(themeName in theme.cssVars)) {
+        theme.cssVars[themeName] = {}
+      }
     }
   }
 

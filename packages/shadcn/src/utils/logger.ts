@@ -1,6 +1,13 @@
 import { highlighter } from "@/src/utils/highlighter"
 
+export enum LogLevel {
+  Info,
+  Debug,
+  Verbose,
+}
+
 export const logger = {
+  logLevel: LogLevel.Info,
   error(...args: unknown[]) {
     console.log(highlighter.error(args.join(" ")))
   },
@@ -15,6 +22,16 @@ export const logger = {
   },
   log(...args: unknown[]) {
     console.log(args.join(" "))
+  },
+  debug(...args: unknown[]) {
+    if (this.logLevel >= LogLevel.Debug) {
+      console.log(args.join(" "))
+    }
+  },
+  verbose(...args: unknown[]) {
+    if (this.logLevel >= LogLevel.Verbose) {
+      console.log(args.join(" "))
+    }
   },
   break() {
     console.log("")

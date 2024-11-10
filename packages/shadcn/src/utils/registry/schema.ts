@@ -30,10 +30,12 @@ export const registryItemTailwindSchema = z.object({
     .optional(),
 })
 
-export const registryItemCssVarsSchema = z.object({
-  light: z.record(z.string(), z.string()).optional(),
-  dark: z.record(z.string(), z.string()).optional(),
-})
+export const registryItemCssVarsSchema = z
+  .object({
+    light: z.record(z.string(), z.string()).optional(),
+    dark: z.record(z.string(), z.string()).optional(),
+  })
+  .catchall(z.record(z.string(), z.string()))
 
 export const registryItemSchema = z.object({
   name: z.string(),
@@ -70,14 +72,19 @@ export const iconsSchema = z.record(
 )
 
 export const registryBaseColorSchema = z.object({
-  inlineColors: z.object({
-    light: z.record(z.string(), z.string()),
-    dark: z.record(z.string(), z.string()),
-  }),
-  cssVars: z.object({
-    light: z.record(z.string(), z.string()),
-    dark: z.record(z.string(), z.string()),
-  }),
+  inlineColors: z
+    .object({
+      light: z.record(z.string(), z.string()).optional(),
+      dark: z.record(z.string(), z.string()).optional(),
+    })
+    .catchall(z.record(z.string(), z.string()))
+    .optional(),
+  cssVars: z
+    .object({
+      light: z.record(z.string(), z.string()).optional(),
+      dark: z.record(z.string(), z.string()).optional(),
+    })
+    .catchall(z.record(z.string(), z.string())),
   inlineColorsTemplate: z.string(),
   cssVarsTemplate: z.string(),
 })

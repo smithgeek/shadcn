@@ -2,17 +2,24 @@ import { existsSync, promises as fs } from "fs"
 import path from "path"
 import vm from "vm"
 import { Project } from "ts-morph"
+import { z } from "zod"
 
-import { RegistryItem, registryItemTypeSchema } from "./schema"
+import {
+  RegistryItem,
+  iconsSchema,
+  registryBaseColorSchema,
+  registryItemSchema,
+  registryItemTypeSchema,
+} from "./schema"
 
 const REGISTRY_MODULE_PREFIX = "@/registry/"
 
-async function writeFile(destination: string, content: string) {
+async function writeObjToFile(destination: string, obj: object) {
   const dir = path.parse(destination).dir
   if (!existsSync(dir)) {
     await fs.mkdir(dir, { recursive: true })
   }
-  await fs.writeFile(destination, content, "utf8")
+  await fs.writeFile(destination, JSON.stringify(obj, null, 2), "utf8")
 }
 
 function findDependencies(sourcePath: string) {
@@ -39,10 +46,10 @@ function findDependencies(sourcePath: string) {
   return { dependencies, registryDependencies }
 }
 
-function updateItemConfig(item: RegistryItem, registryFilePath: string) {
+function runSourceFile(sourcePath: string) {
   const project = new Project()
-  project.addSourceFileAtPath(registryFilePath)
-  const itemConfig = project.getSourceFile(registryFilePath)
+  project.addSourceFileAtPath(sourcePath)
+  const itemConfig = project.getSourceFile(sourcePath)
   if (itemConfig) {
     const configOutput = itemConfig.getEmitOutput()
     const context: vm.Context = {
@@ -51,12 +58,20 @@ function updateItemConfig(item: RegistryItem, registryFilePath: string) {
     }
     const code = configOutput.getOutputFiles()[0].getText()
     vm.runInNewContext(code, context)
-    if (typeof context.exports.default === "function") {
-      context.exports.default(item)
-    } else if (typeof context.exports.default === "object") {
+    return context.exports
+  }
+  return null
+}
+
+function updateItemConfig(item: RegistryItem, registryFilePath: string) {
+  const exports = runSourceFile(registryFilePath)
+  if (exports) {
+    if (typeof exports.default === "function") {
+      exports.default(item)
+    } else if (typeof exports.default === "object") {
       item = {
         ...item,
-        ...context.exports.default,
+        ...exports.default,
       }
     }
   }
@@ -104,9 +119,9 @@ async function buildRegistryType(
       item = updateItemConfig(item, registryFilePath)
     }
 
-    await writeFile(
+    await writeObjToFile(
       path.resolve(outputDir, `styles/default/${item.name}.json`),
-      JSON.stringify(item, null, 2)
+      item
     )
 
     items.push({
@@ -119,6 +134,148 @@ async function buildRegistryType(
   }
   return items
 }
+
+function searchForFile(directory: string, fileName: string) {
+  for (const ext of ["ts", "tsx", "js", "jsx"]) {
+    const filePath = path.resolve(directory, `${fileName}.${ext}`)
+    if (existsSync(filePath)) {
+      return filePath
+    }
+  }
+  return null
+}
+
+const styleWithEntrySchema = z.array(
+  z.object({
+    name: z.string(),
+    label: z.string(),
+    entry: registryItemSchema.optional(),
+  })
+)
+
+async function writeStyleIndicies(
+  outputDir: string,
+  object: Object | undefined
+) {
+  const styles = object
+    ? styleWithEntrySchema.parse(object)
+    : [{ name: "default", label: "Default" }]
+  for (const style of styles) {
+    const item: RegistryItem = {
+      name: style.name,
+      type: "registry:style",
+      ...style.entry,
+    }
+    await writeObjToFile(
+      path.resolve(outputDir, `styles/${style.name}/index.json`),
+      item
+    )
+  }
+  await writeObjToFile(
+    path.resolve(outputDir, `styles/index.json`),
+    styles.map((s) => ({ name: s.name, label: s.label }))
+  )
+}
+
+async function writeIconsIndex(outputDir: string, object: Object | undefined) {
+  const icons: z.infer<typeof iconsSchema> = object
+    ? iconsSchema.parse(object)
+    : {}
+  await writeObjToFile(path.resolve(outputDir, `icons/index.json`), icons)
+}
+
+type BaseColorJson = z.infer<typeof registryBaseColorSchema>
+
+function themesToColorJson(
+  themes: z.infer<typeof baseColorsSchema>[number]["themes"]
+) {
+  const cssVars: Record<string, Record<string, string>> = {}
+  const inlineColors: Record<string, Record<string, string>> = {}
+  for (const [themeName, theme] of Object.entries(themes)) {
+    cssVars[themeName] = {}
+    for (const [property, value] of Object.entries(theme)) {
+      if (typeof value === "string") {
+        cssVars[themeName][property] = value
+      } else {
+        cssVars[themeName][property] = value.cssVariable
+        if (value.inlineColor) {
+          inlineColors[themeName] ??= {}
+          inlineColors[themeName][property] = value.inlineColor
+        }
+      }
+    }
+  }
+  return { cssVars, inlineColors }
+}
+
+function cssVarThemeToTemplate(cssVars: BaseColorJson["cssVars"][string]) {
+  return `${Object.keys(cssVars)
+    .map((prop) => `    --${prop}: ${cssVars[prop]};`)
+    .join("\n")}`
+}
+
+function cssVarsToTemplate(cssVars: BaseColorJson["cssVars"]) {
+  return `  ${Object.keys(cssVars)
+    .map(
+      (theme) =>
+        `${theme === "root" ? ":root" : `.${theme}`} {\n${cssVarThemeToTemplate(
+          cssVars[theme]
+        )}`
+    )
+    .join("\n  }\n\n  ")}\n  }`
+}
+
+async function writeColors(outputDir: string, object: Object | undefined) {
+  const colors = baseColorsSchema.parse(object)
+  for (const color of colors) {
+    const { cssVars, inlineColors } = themesToColorJson(color.themes)
+    await writeObjToFile(path.resolve(outputDir, `colors/${color.name}.json`), {
+      inlineColors,
+      cssVars,
+      inlineColorsTemplate:
+        "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+      cssVarsTemplate: `@tailwind base;\n@tailwind components;\n@tailwind utilities;\n\n@layer base {\n${cssVarsToTemplate(
+        cssVars
+      )}\n}\n\n@layer base {\n  * {\n    @apply border-border;\n  }\n  body {\n    @apply bg-background text-foreground;\n  }\n}`,
+    })
+    const themeRegistryItem: RegistryItem = {
+      name: `theme-${color.name}`,
+      type: "registry:theme",
+      cssVars,
+    }
+    await writeObjToFile(
+      path.resolve(outputDir, `themes/${color.name}.json`),
+      themeRegistryItem
+    )
+  }
+  await writeObjToFile(path.resolve(outputDir, `themes/index.json`), {
+    themes: colors.map((color) => ({
+      name: color.name,
+      label: color.label,
+    })),
+  })
+}
+
+const colorThemeSchema = z.record(
+  z.string(),
+  z
+    .object({
+      cssVariable: z.string(),
+      inlineColor: z.string().optional(),
+    })
+    .or(z.string())
+)
+const baseColorsSchema = z.array(
+  z.object({
+    name: z.string(),
+    label: z.string(),
+    themes: z
+      .object({
+        root: colorThemeSchema,
+      })
+      .catchall(colorThemeSchema),
+  })
+)
 
 export async function buildRegistry({
   cwd,
@@ -141,8 +298,29 @@ export async function buildRegistry({
       index = index.concat(items)
     }
   }
-  await writeFile(
-    path.resolve(outputDir, "index.json"),
-    JSON.stringify(index, null, 2)
-  )
+  await writeObjToFile(path.resolve(outputDir, "index.json"), index)
+
+  for (const type of ["styles", "icons", "colors"]) {
+    const filePath = searchForFile(cwd, type)
+    let exports: any = undefined
+    if (filePath !== null) {
+      exports = runSourceFile(filePath)
+    }
+    switch (type) {
+      case "styles":
+        await writeStyleIndicies(outputDir, exports?.default)
+        break
+
+      case "icons":
+        await writeIconsIndex(outputDir, exports?.default)
+        break
+
+      case "colors":
+        await writeColors(outputDir, exports?.default)
+        break
+
+      default:
+        throw new Error(`Unknown type ${type}`)
+    }
+  }
 }
