@@ -8,6 +8,7 @@ import { Command } from "commander"
 import { z } from "zod"
 
 import packageJson from "../package.json"
+import { extractStyles } from "./commands/extractStyles"
 import { registry } from "./commands/registry"
 import { LogLevel, logger } from "./utils/logger"
 
@@ -49,6 +50,7 @@ async function main() {
     .addCommand(migrate)
     .addCommand(info)
     .addCommand(registry)
+    .addCommand(extractStyles)
 
   program.parse()
 }
