@@ -104,25 +104,34 @@ function getParents(element: Node<ts.Node>): {
   }
 }
 
+interface Argument {
+  destructure: string[]
+  type: string
+}
+
 function findDependencies(
   expression: JsxExpression | VariableDeclaration,
   checkArgs: boolean = true
 ) {
   let imports: ImportDeclaration[] = []
   let variables: VariableDeclaration[] = []
-  let functionTypes: string[] = []
-  let destructure: string[] = []
+  let args: Argument[] = []
   expression.getDescendantsOfKind(SyntaxKind.CallExpression).forEach((node) => {
     if (checkArgs) {
       node.getArguments().forEach((arg, i) => {
-        functionTypes.push(
-          `Parameters<typeof ${node.getExpression().getText()}>[${i}] = {}`
-        )
         if (arg.isKind(SyntaxKind.ObjectLiteralExpression)) {
-          functionTypes.push(arg.getType().getText())
-          destructure = destructure.concat(
+          const functionArg: Argument = {
+            type: `Parameters<typeof ${node
+              .getExpression()
+              .getText()}>[${i}] = {}`,
+            destructure: [],
+          }
+
+          functionArg.destructure = functionArg.destructure.concat(
             arg.getProperties().map((p) => p.getText())
           )
+
+          args.push(functionArg)
         }
       })
     }
@@ -137,15 +146,13 @@ function findDependencies(
       )
       imports = imports.concat(nestedDecl.imports)
       variables = variables.concat(nestedDecl.variables)
-      functionTypes = functionTypes.concat(nestedDecl.functionTypes)
-      destructure = destructure.concat(nestedDecl.destructure)
+      args = args.concat(nestedDecl.args)
     }
   })
   return {
     imports,
     variables,
-    functionTypes,
-    destructure,
+    args,
   }
 }
 
@@ -159,12 +166,17 @@ function parseAttribute(jsxAttribute: JsxAttribute) {
         imports: declarations.imports,
         variablesToMove: declarations.variables,
         valueText: initializer.getText(),
-        destructure: declarations.destructure,
-        functionTypes: declarations.functionTypes,
+        args: declarations.args,
+        name: jsxAttribute.getName(),
       }
     }
   }
   return null
+}
+
+interface ObjectProp {
+  propertyName: string
+  value: string
 }
 
 interface WriteableObject {
@@ -175,30 +187,33 @@ interface WriteableObject {
       }
     | {
         type: "function"
-        content: string
-        destructures: string[]
-        functionTypes: string[]
+        props: ObjectProp[]
+        args: Argument[]
       }
 }
 
 function writeObject(writer: CodeBlockWriter, data: WriteableObject) {
   for (const [key, value] of Object.entries(data)) {
     if (value.type === "function") {
-      const variables = value.destructures.join(", ")
-      const types = value.functionTypes.join(" & ")
-      writer.writeLine(`${key}({${variables}}: ${types}){`)
+      const args = value.args
+        .map((a) => `{${a.destructure.join(", ")}}: ${a.type}`)
+        .join(", ")
+      writer.writeLine(`${key}(${args}){`)
       writer.indent(() => {
-        writer.write("return ")
-        if (
-          value.content.startsWith(`"`) ||
-          value.content.startsWith(`'`) ||
-          value.content.startsWith("`")
-        ) {
-          writer.write(value.content)
-        } else {
-          writer.write(value.content.substring(1, value.content.length - 1))
-        }
-        writer.write(";")
+        writer.write(`return { `)
+        value.props.forEach((prop) => {
+          writer.writeLine(`${prop.propertyName}: `)
+          if (
+            prop.value.startsWith(`"`) ||
+            prop.value.startsWith(`'`) ||
+            prop.value.startsWith("`")
+          ) {
+            writer.write(`${prop.value},`)
+          } else {
+            writer.write(`${prop.value.substring(1, prop.value.length - 1)},`)
+          }
+        })
+        writer.write(" };")
       })
       writer.writeLine("},")
     } else {
@@ -266,9 +281,8 @@ function addGetStyleProps(
   object: WriteableObject,
   component: string,
   parents: string[],
-  value: string,
-  destructures: string[],
-  functionTypes: string[]
+  props: ObjectProp[],
+  args: Argument[]
 ) {
   let stylePath = "styles"
   let current = object
@@ -290,14 +304,14 @@ function addGetStyleProps(
 
   current["getStyleProps"] = {
     type: "function",
-    content: value,
-    destructures,
-    functionTypes,
+    props,
+    args,
   }
   return stylePath
 }
 
 const iconPackages = ["lucide", "icon"]
+const styleAttributes = ["className", "style"]
 
 export const extractStyles = new Command()
   .name("extract")
@@ -310,7 +324,7 @@ export const extractStyles = new Command()
   .action(async (opts) => {
     const styles = ["new-york"]
     const extractIcons: any = {}
-    const components = ["button"]
+    const components = ["button", "accordion"]
     const project = createProject()
     for (const component of components) {
       for (const style of styles) {
@@ -350,37 +364,46 @@ export const extractStyles = new Command()
             console.log(`${jsxElement.getTagNameNode().getText()} is an icon`)
           }
 
-          const classNameAttribute = jsxElement.getAttribute("className")
-          if (classNameAttribute?.isKind(SyntaxKind.JsxAttribute)) {
-            const { ancestors, root: rootElement } = jsxElement.isKind(
-              SyntaxKind.JsxOpeningElement
-            )
-              ? getParents(jsxElement.getParent())
-              : getParents(jsxElement)
-            if (rootElement) {
-              rootElements.push(rootElement)
-            }
+          const props: ObjectProp[] = []
+          let args: Argument[] = []
 
-            const attr = parseAttribute(classNameAttribute)
-            if (attr) {
-              imports = imports.concat(attr.imports)
-              variablesToMove = variablesToMove.concat(attr.variablesToMove)
-              const stylePath = addGetStyleProps(
-                extractedStyle,
-                component,
-                ancestors,
-                attr.valueText,
-                attr.destructure,
-                attr.functionTypes
-              )
-
-              jsxElement.insertAttribute(0, {
-                kind: StructureKind.JsxSpreadAttribute,
-                expression: stylePath,
-              })
-            }
-            classNameAttribute.remove()
+          const { ancestors, root: rootElement } = jsxElement.isKind(
+            SyntaxKind.JsxOpeningElement
+          )
+            ? getParents(jsxElement.getParent())
+            : getParents(jsxElement)
+          if (rootElement) {
+            rootElements.push(rootElement)
           }
+
+          styleAttributes.forEach((styleAttribute) => {
+            const classNameAttribute = jsxElement.getAttribute(styleAttribute)
+            if (classNameAttribute?.isKind(SyntaxKind.JsxAttribute)) {
+              const attr = parseAttribute(classNameAttribute)
+              if (attr) {
+                imports = imports.concat(attr.imports)
+                variablesToMove = variablesToMove.concat(attr.variablesToMove)
+                props.push({
+                  propertyName: attr.name,
+                  value: attr.valueText,
+                })
+                args = args.concat(attr.args)
+              }
+              classNameAttribute.remove()
+            }
+          })
+          const stylePath = addGetStyleProps(
+            extractedStyle,
+            component,
+            ancestors,
+            props,
+            args
+          )
+
+          jsxElement.insertAttribute(0, {
+            kind: StructureKind.JsxSpreadAttribute,
+            expression: stylePath,
+          })
         })
         distinct(rootElements).forEach((rootElement) => {
           inject(rootElement)
@@ -392,6 +415,12 @@ export const extractStyles = new Command()
               .getNamedImports()
               .map((i) => i.getName()),
           })
+        })
+        source.addImportDeclaration({
+          namedImports: distinct(variablesToMove)
+            .map((v) => v.getName())
+            .concat(["styles"]),
+          moduleSpecifier: `@/registry/styles/${style}/${component}`,
         })
         distinct(variablesToMove).forEach((variableDeclaration) => {
           styleSource.addVariableStatement({
@@ -410,6 +439,7 @@ export const extractStyles = new Command()
           })
           variableDeclaration.remove()
         })
+
         const copiedFile = source.copy(
           path.join(opts.cwd, "registry", "ui", `${component}.tsx`),
           { overwrite: true }
