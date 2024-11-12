@@ -38,10 +38,10 @@ export const extractStyles = new Command()
     const styles = ["new-york"]
     const extractIcons: any = {}
     console.log("loading components")
-    // const components = await getComponents(
-    //   path.join(opts.cwd, "registry", "default", "ui")
-    // )
-    const components = ["calendar"]
+    const components = await getComponents(
+      path.join(opts.cwd, "registry", "default", "ui")
+    )
+    // const components = ["calendar"]
     const project = createProject()
 
     const tasks: Promise<void>[] = []

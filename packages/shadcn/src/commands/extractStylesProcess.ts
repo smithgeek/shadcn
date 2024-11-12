@@ -1,7 +1,9 @@
 import path from "path"
 import { Worker, parentPort, workerData } from "worker_threads"
 import {
+  ArrowFunction,
   CodeBlockWriter,
+  FunctionDeclaration,
   ImportDeclaration,
   JsxAttribute,
   JsxExpression,
@@ -72,9 +74,9 @@ function inject(element: Node<ts.Node>, name: string, variables: string[]) {
 
 function getParents(element: Node<ts.Node>): {
   ancestors: string[]
-  rootFunction: Node<ts.Node> | null
+  rootFunction: ArrowFunction | FunctionDeclaration | null
 } {
-  let rootFunction: Node<ts.Node> | null = null
+  let rootFunction: ArrowFunction | FunctionDeclaration | null = null
   if (element.isKind(SyntaxKind.ArrowFunction)) {
     rootFunction = element
   }
@@ -124,27 +126,120 @@ interface Argument {
   types: string[]
 }
 
+function getResolvedTypeName(type: Type<ts.Type>) {
+  const symbol = type.getSymbol()
+  if (symbol) {
+    const aliasedSymbol = symbol.getAliasedSymbol()
+    return aliasedSymbol ? aliasedSymbol.getName() : symbol.getName()
+  }
+  return type.getText() // fallback to getText() if no symbol is found
+}
+
+function getTypeStringAtNode(symbol: Symbol | undefined, node: Node) {
+  if (!symbol) {
+    return ""
+  }
+  let str = ""
+  if (symbol.hasFlags(ts.SymbolFlags.Optional)) {
+    str += "?: "
+  } else {
+    str += ": "
+  }
+  const type = symbol.getTypeAtLocation(node)
+  str += getResolvedTypeName(type)
+  if (isPossiblyUndefined(type)) {
+    str += " | undefined"
+  }
+  if (isPossiblyNull(type)) {
+    str += " | null"
+  }
+  return str
+}
+
+function isPossiblyUndefined(type: Type) {
+  if (type.isUndefined()) return true
+  if (type.isUnion()) {
+    return type.getUnionTypes().some((t) => t.isUndefined())
+  }
+  return false
+}
+
+function isPossiblyNull(type: Type) {
+  if (type.isNullable()) return true
+  if (type.isUnion()) {
+    return type.getUnionTypes().some((t) => t.isNullable())
+  }
+  return false
+}
+
+function getComponentProps(
+  rootFunction: ArrowFunction | FunctionDeclaration,
+  propNames: string[]
+) {
+  const propsParam = rootFunction.getParameter("props")
+  const typeNode = propsParam?.getTypeNode()
+  let propTypeName: string | null = null
+  let importType: string | null = null
+  if (typeNode) {
+    propTypeName = typeNode.getText()
+    importType = propTypeName
+  } else if (rootFunction.isKind(SyntaxKind.ArrowFunction)) {
+    let element: Node | undefined = rootFunction
+    while (element && !element.isKind(SyntaxKind.VariableDeclaration)) {
+      element = element.getParent()
+    }
+    if (element) {
+      propTypeName = `Parameters<typeof ${element.getName()}>[0]`
+      importType = element.getName()
+    }
+  }
+  if (propTypeName !== null) {
+    return {
+      type: `Pick<${propTypeName}, ${propNames
+        .map((p) => `"${p}"`)
+        .join(" | ")}>`,
+      importType,
+    }
+  }
+  // const props: string[] = []
+  // if (propsParam) {
+  //   const resolved = getResolvedTypeName(propsParam.getType())
+  //   propNames.forEach((propName) => {
+  //     const propsType = propsParam.getType()
+  //     const classNameProperty = propsType.getProperty(propName)
+  //     props.push(
+  //       `${propName}${getTypeStringAtNode(classNameProperty, propsParam)}`
+  //     )
+  //   })
+  // }
+  // return props
+  return {
+    type: "any",
+    importType: null,
+  }
+}
+
 function findDependencies(
   expression: JsxExpression | VariableDeclaration,
   checkArgs: boolean = true
 ) {
-  let imports: ImportDeclaration[] = []
-  let variables: VariableDeclaration[] = []
-  let args: Argument[] = []
+  const imports: ImportDeclaration[] = []
+  const variables: VariableDeclaration[] = []
+  const args: Argument[] = []
   expression.getDescendantsOfKind(SyntaxKind.CallExpression).forEach((node) => {
     if (checkArgs) {
       node.getArguments().forEach((arg, i) => {
         if (arg.isKind(SyntaxKind.ObjectLiteralExpression)) {
           const functionArg: Argument = {
-            types: [
-              `Parameters<typeof ${node.getExpression().getText()}>[${i}]`,
-            ],
             variables: [],
+            types: [],
           }
 
-          functionArg.variables = functionArg.variables.concat(
-            arg.getProperties().map((p) => p.getText())
-          )
+          arg.getProperties().forEach((p) => {
+            if (p.isKind(SyntaxKind.ShorthandPropertyAssignment)) {
+              functionArg.variables.push(p.getText())
+            }
+          })
 
           args.push(functionArg)
         }
@@ -159,9 +254,9 @@ function findDependencies(
         declaration.variableDeclaration,
         false
       )
-      imports = imports.concat(nestedDecl.imports)
-      variables = variables.concat(nestedDecl.variables)
-      args = args.concat(nestedDecl.args)
+      imports.push(...nestedDecl.imports)
+      variables.push(...nestedDecl.variables)
+      args.push(...nestedDecl.args)
     }
   })
   return {
@@ -209,6 +304,8 @@ function parseAttribute(
   const initializer = jsxAttribute.getInitializer()
 
   if (initializer) {
+    //const maybeProps = initializer.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)[0];
+    //maybeProps.getType().getdecl
     if (initializer.isKind(SyntaxKind.JsxExpression)) {
       const declarations = findDependencies(initializer)
       return {
@@ -235,6 +332,7 @@ interface ExtractedStyling {
   [key: string]: {
     args: Argument
     obj: WriteableObject
+    types: string[]
   }
 }
 
@@ -271,11 +369,9 @@ function createObject(source: SourceFile, object: ExtractedStyling) {
             Object.entries(object).forEach(([key, value]) => {
               const args = `{${distinct(value.args.variables).join(
                 ", "
-              )}}: ${value.args.types.join(" & ")}`
+              )}}: ${distinct(value.args.types).join(", ")}`
               writer.write(
-                `get${key[0].toUpperCase()}${key.substring(
-                  1
-                )}Styles(${args} = {}) {`
+                `get${key[0].toUpperCase()}${key.substring(1)}Styles(${args}) {`
               )
               writer.indent(() => {
                 writer.write("return ")
@@ -316,9 +412,9 @@ function addGetStyleProps(
     object[topLevelName] = {
       args,
       obj: {},
+      types: [],
     }
   } else {
-    object[topLevelName].args.types.push(...args.types)
     object[topLevelName].args.variables.push(...args.variables)
   }
 
@@ -358,7 +454,7 @@ export async function processSource({
   )
   const rootElements: {
     name: string
-    rootFunction: Node<ts.Node>
+    rootFunction: ArrowFunction | FunctionDeclaration
   }[] = []
   let imports: ImportDeclaration[] = []
   let variablesToMove: VariableDeclaration[] = []
@@ -420,10 +516,8 @@ export async function processSource({
           })
           attr.args.forEach((arg) => {
             args.variables = args.variables.concat(arg.variables)
-            args.types = args.types.concat(arg.types)
           })
           args.variables.push(attr.name)
-          args.types.push(`{ ${toObjectTypeDecl(attr.name, attr.type)} }`)
         }
         attributesToRemove.push(attribute)
       }
@@ -444,13 +538,28 @@ export async function processSource({
       })
     }
   })
+
   distinctBy(rootElements, (r) => r.name).forEach((rootElement) => {
+    const stylePropName = getPropertyName(rootElement.name, componentName)
+    const args = extractedStyle[stylePropName]?.args
+    const variables = args?.variables ?? []
+    if (args) {
+      const componentProps = getComponentProps(
+        rootElement.rootFunction,
+        variables
+      )
+      args.types = [componentProps.type]
+      if (componentProps.importType) {
+        styleSource.addImportDeclaration({
+          moduleSpecifier: `@/registry/ui/${componentName}`,
+          namedImports: [componentProps.importType],
+        })
+      }
+    }
     inject(
       rootElement.rootFunction,
       getPropertyName(rootElement.name, componentName),
-      extractedStyle[
-        `${rootElement.name[0].toLowerCase()}${rootElement.name.slice(1)}`
-      ]?.args?.variables ?? []
+      variables
     )
   })
   distinct(imports).forEach((importDeclaration) => {
