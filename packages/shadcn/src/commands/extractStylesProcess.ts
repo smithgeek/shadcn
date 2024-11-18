@@ -38,6 +38,13 @@ function callGetStyles(functionBuilder: StyleFunctionBuilder) {
 	return `styling.get${functionBuilder.name}(${argList})`;
 }
 
+function getTypeString(typeInfo: TypeInfo | undefined | null) {
+	if (!typeInfo) {
+		return "unknown";
+	}
+	return distinct(typeInfo.types).join(" | ");
+}
+
 function createStyleObject(source: SourceFile, styleBuilder: StyleFileBuilder) {
 	styleBuilder.style.functions
 		.filter((f) => f.parameters.length > 0)
@@ -47,7 +54,7 @@ function createStyleObject(source: SourceFile, styleBuilder: StyleFileBuilder) {
 					.filter((p) => p.type !== null)
 					.map((p) => ({
 						name: `${p.destinationName ?? p.sourceName}${p.type!.isOptional ? "?" : ""}`,
-						type: p.type!.text,
+						type: getTypeString(p.type),
 					})),
 				(p) => p.name
 			);
@@ -138,6 +145,7 @@ interface StyleFunctionBuilder {
 	parameters: VariableDefinition[];
 	rootFunction: ArrowFunction | FunctionDeclaration;
 	properties: Record<string, () => string>;
+	addParameter(parameter: VariableDefinition): void;
 }
 
 interface StyleFileBuilder {
@@ -178,6 +186,11 @@ function createStyleFileBuilder(): StyleFileBuilder {
 						parameters: [],
 						rootFunction,
 						properties: {},
+						addParameter(parameter) {
+							if (this.parameters.every((p) => p.sourceName !== parameter.sourceName)) {
+								this.parameters.push(parameter);
+							}
+						},
 					};
 					this.functions.push(func);
 				}
@@ -215,9 +228,9 @@ type ImportInfo =
 	  };
 
 interface TypeInfo {
-	text: string;
 	imports: ImportInfo[];
 	isOptional: boolean;
+	types: string[];
 }
 
 function getImportInfo(declaration: ImportDeclaration, name: string) {
@@ -226,12 +239,12 @@ function getImportInfo(declaration: ImportDeclaration, name: string) {
 	if (namedImport) {
 		return {
 			name,
-			from: declaration.getModuleSpecifier().getText().replace(/"/g, ""),
+			from: declaration.getModuleSpecifier().getLiteralText(),
 		};
 	} else if (importClause) {
 		return {
 			clause: importClause.getText(),
-			from: declaration.getModuleSpecifier().getText().replace(/"/g, ""),
+			from: declaration.getModuleSpecifier().getLiteralText(),
 		};
 	}
 	return null;
@@ -241,27 +254,56 @@ function removeFileExtension(fileName: string) {
 	return fileName.substring(0, fileName.indexOf("."));
 }
 
-function resolveImportSpecifier(node: Node): string | null {
-	const symbol = node.getType().getSymbol() ?? node.getType().getAliasSymbol();
-	if (!symbol) return null;
+function tryGetTypeSymbol(type: Type) {
+	const symbol = type.getAliasSymbol() ?? type.getSymbol();
+	if (symbol) {
+		return symbol;
+	}
+	if (type.isUnion()) {
+		for (const unionType of type.getUnionTypes()) {
+			const unionSymbol = unionType.getAliasSymbol() ?? unionType.getSymbol();
+			if (unionSymbol) {
+				return unionSymbol;
+			}
+		}
+	}
+	return null;
+}
+
+function resolveImportSpecifier(nodeType: Type, sourceFile: SourceFile): string | null {
+	let symbol = tryGetTypeSymbol(nodeType);
+	if (!symbol) {
+		return null;
+	}
 
 	// Get the declaration of the symbol
 	const declarations = symbol.getDeclarations();
 	if (!declarations.length) return null;
 
 	const declaration = declarations[0];
-	const sourceFile = declaration.getSourceFile();
+	const declarationFile = declaration.getSourceFile();
 
 	// If the symbol comes from node_modules
-	if (sourceFile.isInNodeModules()) {
-		const importingFile = node.getSourceFile();
-		for (const importDeclaration of importingFile.getImportDeclarations()) {
+	if (declarationFile.isInNodeModules()) {
+		if (declarationFile.getFilePath().startsWith("/node_modules/typescript")) {
+			return null;
+		}
+		for (const importDeclaration of sourceFile.getImportDeclarations()) {
 			const filePath = importDeclaration.getModuleSpecifierSourceFile()?.getFilePath();
+			importDeclaration.getModuleSpecifierSourceFile()?.getExportSymbols()[0].getName;
 			if (filePath) {
 				const dir = path.dirname(filePath);
-				const sourceFilePath = sourceFile.getFilePath();
+				const sourceFilePath = declarationFile.getFilePath();
 				if (sourceFilePath.startsWith(dir)) {
 					const module = importDeclaration.getModuleSpecifierValue();
+					if (
+						importDeclaration
+							.getModuleSpecifierSourceFile()
+							?.getExportSymbols()
+							.some((s) => s.getEscapedName() === symbol.getEscapedName())
+					) {
+						return module;
+					}
 					const lookup = `node_modules/${module}`;
 					const index = sourceFilePath.indexOf(lookup);
 					if (index !== -1) {
@@ -270,7 +312,7 @@ function resolveImportSpecifier(node: Node): string | null {
 				}
 			}
 		}
-		return importingFile.getRelativePathAsModuleSpecifierTo(sourceFile);
+		return sourceFile.getRelativePathAsModuleSpecifierTo(declarationFile);
 	}
 
 	// If the symbol is a local file
@@ -280,30 +322,60 @@ function resolveImportSpecifier(node: Node): string | null {
 	}
 
 	// Fallback: compute relative path for non-imported local declarations
-	const relativePath = sourceFile.getRelativePathTo(sourceFile.getFilePath());
+	const relativePath = declarationFile.getRelativePathTo(declarationFile.getFilePath());
 	return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
 }
 
-function getTypeInfo(node: Node<ts.Node>, type: Type | undefined = undefined): TypeInfo {
-	type ??= node.getType();
-
+function getTypeInfo(type: Type, sourceFile: SourceFile): TypeInfo {
 	const typeInfo: TypeInfo = {
-		text: type.getText(),
+		types: [type.getText()],
 		imports: [],
-		isOptional: type.isUndefined() || (type.isUnion() && type.getUnionTypes().some((t) => t.isUndefined())),
+		isOptional: type.isUndefined(),
 	};
 
-	if (typeInfo.text.includes("import(")) {
-		const name = node.getType().getAliasSymbol()?.getEscapedName() ?? node.getType().getSymbol()?.getEscapedName();
-		const module = resolveImportSpecifier(node);
-		if (module && name) {
-			typeInfo.text = name;
-			typeInfo.imports.push({
-				from: module,
-				name,
-			});
-		}
+	if (type.isUnion()) {
+		typeInfo.types = [];
+		return type
+			.getUnionTypes()
+			.map((t) => getTypeInfo(t, sourceFile))
+			.reduce(
+				(p, c) => ({
+					imports: [...p.imports, ...c.imports],
+					types: [...c.types, ...p.types],
+					isOptional: p.isOptional || c.isOptional,
+				}),
+				{
+					...typeInfo,
+				}
+			);
 	}
+
+	typeInfo.types.forEach((t, i) => {
+		if (t.includes("import(")) {
+			const typeArgs: string[] = [];
+			for (const aliasArgType of type.getAliasTypeArguments()) {
+				const typeArgInfo = getTypeInfo(aliasArgType, sourceFile);
+				typeInfo.imports.push(...typeArgInfo.imports);
+				typeArgs.push(typeArgInfo.types.join(" | "));
+			}
+			const symbol = tryGetTypeSymbol(type);
+			let name = symbol?.getEscapedName();
+			if (typeArgs.length > 0) {
+				name = `${name}<${typeArgs.join(", ")}>`;
+			}
+
+			if (name) {
+				typeInfo.types[i] = name;
+				const module = resolveImportSpecifier(type, sourceFile);
+				if (module) {
+					typeInfo.imports.push({
+						from: module,
+						name: symbol?.getEscapedName() ?? "",
+					});
+				}
+			}
+		}
+	});
 	return typeInfo;
 }
 
@@ -330,46 +402,98 @@ interface NodeContext {
 	identifier: Identifier;
 }
 
+function getContextType(node: Node, context: FileContext) {
+	for (const declaration of node.getSymbol()?.getDeclarations() ?? []) {
+		for (const useContext of declaration.getDescendantsOfKind(SyntaxKind.Identifier).filter((n) => n.getText() === "useContext")) {
+			const symbol = useContext.getParent().isKind(SyntaxKind.PropertyAccessExpression)
+				? useContext.getParent().getChildAtIndex(0).getSymbol()
+				: useContext.getSymbol();
+			if (
+				symbol
+					?.getDeclarations()
+					.some((d) => d.getFirstAncestorByKind(SyntaxKind.ImportDeclaration)?.getModuleSpecifier().getLiteralText() === "react")
+			) {
+				const contextIdentifier = useContext
+					.getFirstAncestorByKind(SyntaxKind.CallExpression)
+					?.getFirstChildByKind(SyntaxKind.SyntaxList)
+					?.getFirstChildByKind(SyntaxKind.Identifier);
+				const contextDecls = contextIdentifier?.getSymbol()?.getDeclarations() ?? [];
+				const syntaxList = contextDecls[0]
+					.getFirstChildByKind(SyntaxKind.CallExpression)
+					?.getFirstChildByKind(SyntaxKind.SyntaxList);
+				syntaxList?.getDescendantsOfKind(SyntaxKind.Identifier).forEach((id) => addImports(id, context));
+				return syntaxList?.getText();
+			}
+		}
+	}
+	return null;
+}
+
 function analyzeProperties(nodeContext: NodeContext, functionBuilder: StyleFunctionBuilder, context: FileContext) {
 	const { identifier } = nodeContext;
 
-	const parent = identifier.getParent();
-	// if (parent.isKind(SyntaxKind.PropertyAccessExpression)) {
-	// 	const destinationName = parent.getDescendantsOfKind(SyntaxKind.Identifier).reverse()[0].getText();
-	// 	functionBuilder.parameters.push({
-	// 		sourceName: parent.getText(),
-	// 		type: getTypeInfo(parent),
-	// 		destinationName,
-	// 	});
-	// 	// context.styleBuilder.manipulations.push({
-	// 	// 	action: () => parent.replaceWithText(destinationName),
-	// 	// 	pass: ManipulationPass.BeforeStyleGeneration,
-	// 	// });
-	// } else
-	if (parent.isKind(SyntaxKind.PropertyAssignment)) {
-		const propValue = parent.getChildAtIndex(2);
-		if (propValue.isKind(SyntaxKind.PropertyAccessExpression)) {
-			const firstId = propValue.getChildAtIndex(0);
-			functionBuilder.parameters.push({
-				sourceName: firstId.getText(),
-				type: getTypeInfo(firstId, firstId.getSymbol()?.getTypeAtLocation(propValue)),
+	const contextType = getContextType(identifier, context);
+	if (contextType) {
+		functionBuilder.addParameter({
+			sourceName: identifier.getText(),
+			type: {
+				types: [contextType],
+				imports: [],
+				isOptional: false,
+			},
+		});
+		return;
+	}
+
+	const declarations = identifier.getSymbol()?.getDeclarations() ?? [];
+	let parent = identifier.getParent();
+	for (const declaration of declarations.filter((d) => d.getDescendantsOfKind(SyntaxKind.DotDotDotToken).length > 0)) {
+		const obj = declaration.getParent();
+		if (obj?.isKind(SyntaxKind.ObjectBindingPattern)) {
+			const typeInfo = getTypeInfo(obj.getType(), obj.getSourceFile());
+			const omitProps = obj
+				.getDescendantsOfKind(SyntaxKind.Identifier)
+				.filter((node) => !node.getPreviousSiblingIfKind(SyntaxKind.DotDotDotToken))
+				.map((n) => `"${n.getText()}"`)
+				.join(" | ");
+			typeInfo.types = [`Omit<${typeInfo.types.join(" | ")}, ${omitProps}>`];
+			functionBuilder.addParameter({
+				sourceName: identifier.getText(),
+				type: typeInfo,
 			});
-		} else {
-			functionBuilder.parameters.push({
-				sourceName: parent.getChildAtIndex(2).getText(),
-				type: getTypeInfo(parent, parent.getSymbol()?.getTypeAtLocation(parent.getParent())),
-			});
+			return;
 		}
+	}
+	if (parent.isKind(SyntaxKind.PropertyAssignment)) {
+		parent = parent.getChildAtIndex(2);
+	}
+	if (parent.isKind(SyntaxKind.PropertyAccessExpression)) {
+		const firstId = parent.getChildAtIndex(0);
+		if (firstId !== identifier) {
+			return;
+		}
+		firstId.getSymbol()?.getDeclarations();
+		functionBuilder.addParameter({
+			sourceName: firstId.getText(),
+			type: getTypeInfo(firstId.getSymbol()?.getTypeAtLocation(parent) ?? firstId.getType(), firstId.getSourceFile()),
+		});
+	} else if (parent.isKind(SyntaxKind.Identifier)) {
+		functionBuilder.addParameter({
+			sourceName: parent.getText(),
+			type: getTypeInfo(parent.getSymbol()?.getTypeAtLocation(parent.getParent()) ?? parent.getType(), parent.getSourceFile()),
+		});
 	} else if (
 		parent.isKind(SyntaxKind.BinaryExpression) ||
-		identifier
-			.getSymbol()
-			?.getDeclarations()
-			.some((d) => d.isKind(SyntaxKind.BindingElement))
+		parent.isKind(SyntaxKind.ShorthandPropertyAssignment) ||
+		parent.isKind(SyntaxKind.ConditionalExpression) ||
+		declarations.some((d) => d.isKind(SyntaxKind.BindingElement))
 	) {
-		functionBuilder.parameters.push({
+		functionBuilder.addParameter({
 			sourceName: identifier.getText(),
-			type: getTypeInfo(identifier, identifier.getSymbol()?.getTypeAtLocation(identifier.getParent())),
+			type: getTypeInfo(
+				identifier.getSymbol()?.getTypeAtLocation(identifier.getParent()) ?? identifier.getType(),
+				identifier.getSourceFile()
+			),
 		});
 	}
 }
@@ -410,12 +534,12 @@ function analyzeVariableDeclarations(nodeContext: NodeContext, functionBuilder: 
 					},
 					pass: ManipulationPass.AfterStyleGeneration,
 				});
-			} else {
-				functionBuilder.parameters.push({
-					sourceName: identifier.getText(),
-					type: getTypeInfo(identifier),
-				});
-			}
+			} // else {
+			// 	functionBuilder.addParameter({
+			// 		sourceName: identifier.getText(),
+			// 		type: getTypeInfo(identifier.getType(), identifier.getSourceFile()),
+			// 	});
+			// }
 		});
 }
 
@@ -440,7 +564,7 @@ function analyzeClassVarianceAuthority(nodeContext: NodeContext, functionBuilder
 									const exisitingParam = functionBuilder.parameters.find((p) => p.sourceName === name);
 									if (exisitingParam) {
 										exisitingParam.type = {
-											text: `VariantProps<typeof ${identifier.getText()}>["${prop.getName()}"]`,
+											types: [`VariantProps<typeof ${identifier.getText()}>["${prop.getName()}"]`],
 											imports: [],
 											isOptional: true,
 										};
@@ -669,16 +793,16 @@ async function saveResults({
 	console.log(Date.now() - startTime);
 }
 
-function isReferenceUsed(ref: ReferenceEntry) {
+function isReferenceUsed(ref: ReferenceEntry, sourceFile: SourceFile) {
 	const node = ref.getNode();
-	if (node.getParentIfKind(SyntaxKind.ImportSpecifier)) {
+	if (sourceFile.getFilePath() !== ref.getSourceFile().getFilePath() || node.getParentIfKind(SyntaxKind.ImportSpecifier)) {
 		return false;
 	}
 	return true;
 }
 
-function getUsedReferences(references: ReferencedSymbol[]) {
-	return references.flatMap((ref) => ref.getReferences()).filter(isReferenceUsed);
+function getUsedReferences(references: ReferencedSymbol[], sourceFile: SourceFile) {
+	return references.flatMap((ref) => ref.getReferences()).filter((r) => isReferenceUsed(r, sourceFile));
 }
 
 function removeUnusedImports(sourceFile: SourceFile) {
@@ -687,7 +811,7 @@ function removeUnusedImports(sourceFile: SourceFile) {
 	for (const importDeclaration of sourceFile.getImportDeclarations()) {
 		let used = 0;
 		for (const importSpecifier of importDeclaration.getNamedImports()) {
-			const references = getUsedReferences(importSpecifier.getNameNode().findReferences());
+			const references = getUsedReferences(importSpecifier.getNameNode().findReferences(), sourceFile);
 
 			if (references.length === 0) {
 				unusedImports.push(importSpecifier);
@@ -697,13 +821,13 @@ function removeUnusedImports(sourceFile: SourceFile) {
 		}
 
 		const defaultImport = importDeclaration.getDefaultImport();
-		if (defaultImport && getUsedReferences(defaultImport.findReferences()).length > 0) {
+		if (defaultImport && getUsedReferences(defaultImport.findReferences(), sourceFile).length > 0) {
 			used++;
 		}
 
 		const namespaceImport = importDeclaration.getNamespaceImport();
 		if (namespaceImport) {
-			const references = getUsedReferences(namespaceImport.findReferences());
+			const references = getUsedReferences(namespaceImport.findReferences(), sourceFile);
 			if (references.length > 0) {
 				used++;
 			}

@@ -61,18 +61,11 @@ export const extractStyles = new Command()
 	.description("extract styles from components")
 	.option("-c, --cwd <cwd>", "the working directory. defaults to the current directory.", process.cwd())
 	.action(async (opts) => {
-		const styles = ["new-york"];
+		const styles = ["new-york", "default"];
 		const extractIcons: any = {};
 		console.log("loading components");
-		//const components = await getComponents(path.join(opts.cwd, "registry", "default", "ui"));
-		const components = [
-			"chart",
-			// "form",
-			// "input-otp",
-			// "pagination",
-			// "sidebar",
-			// "toggle-group",
-		];
+		const components = await getComponents(path.join(opts.cwd, "registry", "default", "ui"));
+		//const components = ["chart"];
 		const project = createProject(searchForTsConfig(opts.cwd));
 
 		const tasks: Promise<void>[] = [];
