@@ -32,49 +32,34 @@ function toPropertyAssignment(variable: VariableDefinition) {
 	return `${variable.destinationName}: ${variable.sourceName}`;
 }
 
-function inject(functionBuilder: StyleFunctionBuilder) {
+function callGetStyles(functionBuilder: StyleFunctionBuilder) {
 	const args = distinctBy(functionBuilder.parameters, (p) => p.sourceName).map(toPropertyAssignment);
 	const argList = args.length > 0 ? `{ ${args.join(", ")} }` : "";
-	const stylesCode = `const styles = styling.get${functionBuilder.name}(${argList})`;
-	const { rootFunction } = functionBuilder;
-	if (rootFunction.isKind(SyntaxKind.ArrowFunction)) {
-		const body = rootFunction.getBody();
-		if (body.isKind(SyntaxKind.Block)) {
-			body.insertStatements(functionBuilder.injectLocation, stylesCode);
-		} else if (body.isKind(SyntaxKind.ParenthesizedExpression)) {
-			body.replaceWithText((writer) => {
-				writer.block(() => {
-					writer.writeLine(stylesCode);
-					writer.writeLine(`return ${body.getText()}`);
-				});
-			});
-		}
-	} else if (rootFunction.isKind(SyntaxKind.FunctionDeclaration)) {
-		rootFunction.insertStatements(functionBuilder.injectLocation, stylesCode);
-	}
+	return `styling.get${functionBuilder.name}(${argList})`;
 }
 
 function createStyleObject(source: SourceFile, styleBuilder: StyleFileBuilder) {
-	styleBuilder.style.functions.forEach((fb) => {
-		const properties = distinctBy(
-			fb.parameters
-				.filter((p) => p.type !== null)
-				.map((p) => ({
-					name: `${p.destinationName ?? p.sourceName}${p.type!.isOptional ? "?" : ""}`,
-					type: p.type!.text,
-				})),
-			(p) => p.name
-		);
-		source.addStatements((writer) => {
-			writer.writeLine("");
-			writer.writeLine(`export interface ${fb.name}Props{`);
-			writer.indent(() => {
-				properties.forEach((p) => writer.writeLine(`${p.name}: ${p.type};`));
+	styleBuilder.style.functions
+		.filter((f) => f.parameters.length > 0)
+		.forEach((fb) => {
+			const properties = distinctBy(
+				fb.parameters
+					.filter((p) => p.type !== null)
+					.map((p) => ({
+						name: `${p.destinationName ?? p.sourceName}${p.type!.isOptional ? "?" : ""}`,
+						type: p.type!.text,
+					})),
+				(p) => p.name
+			);
+			source.addStatements((writer) => {
+				writer.writeLine("");
+				writer.writeLine(`export interface ${fb.name}Props{`);
+				writer.indent(() => {
+					properties.forEach((p) => writer.writeLine(`${p.name}: ${p.type};`));
+				});
+				writer.writeLine(`}`);
 			});
-			const intersectionTypes = distinct(fb.intersectionTypes);
-			writer.writeLine(`}${intersectionTypes.length > 0 ? ` & ${intersectionTypes.join(" & ")}` : ""}`);
 		});
-	});
 
 	styleBuilder.style.variables.forEach((v) => {
 		source.addVariableStatement({
@@ -102,29 +87,26 @@ function createStyleObject(source: SourceFile, styleBuilder: StyleFileBuilder) {
 				initializer: (writer) => {
 					writer.block(() => {
 						styleBuilder.style.functions.forEach((fb) => {
-							const args = `{${distinct(fb.parameters.map((p) => p.destinationName ?? p.sourceName)).join(", ")}}: ${
-								fb.name
-							}Props`;
-							const addDefault = fb.parameters.every((p) => p.type === null || p.type.isOptional);
+							const args =
+								fb.parameters.length === 0
+									? ""
+									: `{${distinct(fb.parameters.map((p) => p.destinationName ?? p.sourceName)).join(", ")}}: ${
+											fb.name
+									  }Props`;
+							const addDefault = fb.parameters.length > 0 && fb.parameters.every((p) => p.type === null || p.type.isOptional);
 							writer.write(`get${fb.name}(${args}${addDefault ? " = {}" : ""}) {`);
 							writer.indent(() => {
 								writer.write("return ");
 								writer.block(() => {
-									for (const group of fb.groups) {
-										writer.write(`"${group.name}": {`);
-										writer.indent(() => {
-											Object.entries(group.properties).forEach(([prop, getValue]) => {
-												writer.write(`${prop}: `);
-												const value = getValue();
-												if (value.startsWith(`"`) || value.startsWith(`'`) || value.startsWith("`")) {
-													writer.write(`${value},`);
-												} else {
-													writer.write(`${value.substring(1, value.length - 1)},`);
-												}
-											});
-										});
-										writer.writeLine("},");
-									}
+									Object.entries(fb.properties).forEach(([prop, getValue]) => {
+										writer.write(`${prop}: `);
+										const value = getValue();
+										if (value.startsWith(`"`) || value.startsWith(`'`) || value.startsWith("`")) {
+											writer.write(`${value},`);
+										} else {
+											writer.write(`${value.substring(1, value.length - 1)},`);
+										}
+									});
 								});
 							});
 							writer.writeLine("},");
@@ -151,27 +133,17 @@ enum ManipulationPass {
 	AfterStyleGeneration,
 }
 
-interface StyleGroup {
-	name: string;
-	properties: Record<string, () => string>;
-}
-
 interface StyleFunctionBuilder {
 	name: string;
 	parameters: VariableDefinition[];
-	groups: StyleGroup[];
-	getGroup(name: string): StyleGroup;
-	createGroup(jsxElement: JsxBeginElement): StyleGroup;
 	rootFunction: ArrowFunction | FunctionDeclaration;
-	injectLocation: number;
-	injectAfter(node: Node): void;
-	intersectionTypes: string[];
+	properties: Record<string, () => string>;
 }
 
 interface StyleFileBuilder {
 	style: {
 		functions: StyleFunctionBuilder[];
-		getFunction(name: string, rootFunction: ArrowFunction | FunctionDeclaration): StyleFunctionBuilder;
+		getFunction(name: string, rootFunction: ArrowFunction | FunctionDeclaration, forceCreate?: boolean): StyleFunctionBuilder;
 		variables: {
 			declaration: VariableDeclaration;
 			export: boolean;
@@ -191,49 +163,21 @@ function createStyleFileBuilder(): StyleFileBuilder {
 			functions: [],
 			variables: [],
 			imports: [],
-			getFunction(name: string, rootFunction) {
+			getFunction(name: string, rootFunction, forceCreate: boolean = false) {
+				const originalName = name;
 				let func = this.functions.find((f) => f.name === name);
+				let i = 2;
+				while (forceCreate && func) {
+					name = `${originalName}${i}`;
+					i++;
+					func = this.functions.find((f) => f.name === name);
+				}
 				if (!func) {
 					func = {
 						name,
 						parameters: [],
-						groups: [],
-						getGroup(name) {
-							let group = this.groups.find((g) => g.name === name);
-							if (!group) {
-								group = { name, properties: {} };
-								this.groups.push(group);
-							}
-							return group;
-						},
-						createGroup(jsxElement: JsxBeginElement) {
-							const originalName = getGroupName(jsxElement);
-							let name = originalName;
-							let i = 2;
-							while (this.groups.find((g) => g.name === name)) {
-								name = `${originalName}${i}`;
-								i++;
-							}
-							return this.getGroup(name);
-						},
 						rootFunction,
-						injectLocation: 0,
-						intersectionTypes: [],
-						injectAfter(node: Node) {
-							const tree = [node];
-							let current = node.getParent();
-							while (current && current != this.rootFunction) {
-								tree.push(current);
-								current = current.getParent();
-							}
-							if (current === this.rootFunction) {
-								if (tree[tree.length - 1].isKind(SyntaxKind.Block)) {
-									this.injectLocation = Math.max(this.injectLocation, tree[tree.length - 2].getChildIndex() + 1);
-								} else {
-									this.injectLocation = Math.max(this.injectLocation, tree[tree.length - 1].getChildIndex() + 1);
-								}
-							}
-						},
+						properties: {},
 					};
 					this.functions.push(func);
 				}
@@ -276,21 +220,6 @@ interface TypeInfo {
 	isOptional: boolean;
 }
 
-function findParentType(node: Node) {
-	const declarations = node.getSymbol()?.getDeclarations() ?? [];
-	for (const declaration of declarations) {
-		let currentNode: Node | undefined = declaration;
-		while (currentNode) {
-			if (currentNode.isKind(SyntaxKind.Parameter)) {
-				return currentNode.getTypeNode()?.getText();
-			} else {
-				currentNode = currentNode.getParent();
-			}
-		}
-	}
-	return undefined;
-}
-
 function getImportInfo(declaration: ImportDeclaration, name: string) {
 	const importClause = declaration.getFirstDescendantByKind(SyntaxKind.ImportClause);
 	const namedImport = declaration.getFirstDescendantByKind(SyntaxKind.NamedImports);
@@ -308,53 +237,51 @@ function getImportInfo(declaration: ImportDeclaration, name: string) {
 	return null;
 }
 
-function getNullAndUndefinedTypes(node: Node) {
-	const type = node.getType();
-	const resultType: string[] = [];
-	if (type.isUndefined() || (type.isUnion() && type.getUnionTypes().some((t) => t.isUndefined()))) {
-		resultType.push("undefined");
-	}
-	if (type.isNull() || (type.isUnion() && type.getUnionTypes().some((t) => t.isNull()))) {
-		resultType.push("null");
-	}
-	return resultType;
+function removeFileExtension(fileName: string) {
+	return fileName.substring(0, fileName.indexOf("."));
 }
 
-function getTypeFromImport(node: Node<ts.Node>, typeInfo: TypeInfo) {
-	const name = findParentType(node);
-	if (name) {
-		let typeAlias: Node | undefined = undefined;
-		let current: Node | undefined = node;
-		while (typeAlias === undefined && current !== undefined) {
-			if (Node.isStatemented(current)) {
-				typeAlias = current.getTypeAlias(name);
-				if (typeAlias !== undefined) {
-					break;
+function resolveImportSpecifier(node: Node): string | null {
+	const symbol = node.getType().getSymbol() ?? node.getType().getAliasSymbol();
+	if (!symbol) return null;
+
+	// Get the declaration of the symbol
+	const declarations = symbol.getDeclarations();
+	if (!declarations.length) return null;
+
+	const declaration = declarations[0];
+	const sourceFile = declaration.getSourceFile();
+
+	// If the symbol comes from node_modules
+	if (sourceFile.isInNodeModules()) {
+		const importingFile = node.getSourceFile();
+		for (const importDeclaration of importingFile.getImportDeclarations()) {
+			const filePath = importDeclaration.getModuleSpecifierSourceFile()?.getFilePath();
+			if (filePath) {
+				const dir = path.dirname(filePath);
+				const sourceFilePath = sourceFile.getFilePath();
+				if (sourceFilePath.startsWith(dir)) {
+					const module = importDeclaration.getModuleSpecifierValue();
+					const lookup = `node_modules/${module}`;
+					const index = sourceFilePath.indexOf(lookup);
+					if (index !== -1) {
+						return `${module}${removeFileExtension(sourceFilePath.substring(index + lookup.length))}`;
+					}
 				}
 			}
-			current = current.getParent();
 		}
-		if (typeAlias) {
-			typeAlias.getDescendantsOfKind(SyntaxKind.TypeReference).forEach((typeRef) => {
-				const actualType = typeRef.getType().getProperty(node.getText());
-				typeInfo.text = [`${typeRef.getText()}["${node.getText()}"]`].concat(getNullAndUndefinedTypes(node)).join(" | ");
-				typeRef.getDescendantsOfKind(SyntaxKind.Identifier).forEach((identifier) => {
-					identifier
-						.getSymbol()
-						?.getDeclarations()
-						.forEach((decl) => {
-							const importDeclaration = decl.getFirstAncestorByKind(SyntaxKind.ImportDeclaration);
-							if (importDeclaration) {
-								const imp = getImportInfo(importDeclaration, identifier.getText());
-								if (imp) {
-									typeInfo.imports.push(imp);
-								}
-							}
-						});
-				});
-			});
-		}
+		return importingFile.getRelativePathAsModuleSpecifierTo(sourceFile);
 	}
+
+	// If the symbol is a local file
+	const importDeclaration = declaration.getFirstAncestorByKind(ts.SyntaxKind.ImportDeclaration);
+	if (importDeclaration) {
+		return importDeclaration.getModuleSpecifierValue();
+	}
+
+	// Fallback: compute relative path for non-imported local declarations
+	const relativePath = sourceFile.getRelativePathTo(sourceFile.getFilePath());
+	return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
 }
 
 function getTypeInfo(node: Node<ts.Node>, type: Type | undefined = undefined): TypeInfo {
@@ -367,7 +294,15 @@ function getTypeInfo(node: Node<ts.Node>, type: Type | undefined = undefined): T
 	};
 
 	if (typeInfo.text.includes("import(")) {
-		getTypeFromImport(node, typeInfo);
+		const name = node.getType().getAliasSymbol()?.getEscapedName() ?? node.getType().getSymbol()?.getEscapedName();
+		const module = resolveImportSpecifier(node);
+		if (module && name) {
+			typeInfo.text = name;
+			typeInfo.imports.push({
+				from: module,
+				name,
+			});
+		}
 	}
 	return typeInfo;
 }
@@ -398,30 +333,45 @@ interface NodeContext {
 function analyzeProperties(nodeContext: NodeContext, functionBuilder: StyleFunctionBuilder, context: FileContext) {
 	const { identifier } = nodeContext;
 
-	const declarations = identifier.getSymbol()?.getDeclarations();
-	declarations
-		?.filter((d) => d.isKind(SyntaxKind.BindingElement) || d.isKind(SyntaxKind.ShorthandPropertyAssignment))
-		.forEach((declaration) => {
-			const parent = identifier.getParent();
-			if (parent.isKind(SyntaxKind.PropertyAccessExpression)) {
-				const destinationName = parent.getDescendantsOfKind(SyntaxKind.Identifier).reverse()[0].getText();
-				functionBuilder.parameters.push({
-					sourceName: parent.getText(),
-					type: getTypeInfo(parent),
-					destinationName,
-				});
-				context.styleBuilder.manipulations.push({
-					action: () => parent.replaceWithText(destinationName),
-					pass: ManipulationPass.BeforeStyleGeneration,
-				});
-			} else {
-				functionBuilder.parameters.push({
-					sourceName: identifier.getText(),
-					type: getTypeInfo(identifier),
-				});
-				functionBuilder.injectAfter(declaration);
-			}
+	const parent = identifier.getParent();
+	// if (parent.isKind(SyntaxKind.PropertyAccessExpression)) {
+	// 	const destinationName = parent.getDescendantsOfKind(SyntaxKind.Identifier).reverse()[0].getText();
+	// 	functionBuilder.parameters.push({
+	// 		sourceName: parent.getText(),
+	// 		type: getTypeInfo(parent),
+	// 		destinationName,
+	// 	});
+	// 	// context.styleBuilder.manipulations.push({
+	// 	// 	action: () => parent.replaceWithText(destinationName),
+	// 	// 	pass: ManipulationPass.BeforeStyleGeneration,
+	// 	// });
+	// } else
+	if (parent.isKind(SyntaxKind.PropertyAssignment)) {
+		const propValue = parent.getChildAtIndex(2);
+		if (propValue.isKind(SyntaxKind.PropertyAccessExpression)) {
+			const firstId = propValue.getChildAtIndex(0);
+			functionBuilder.parameters.push({
+				sourceName: firstId.getText(),
+				type: getTypeInfo(firstId, firstId.getSymbol()?.getTypeAtLocation(propValue)),
+			});
+		} else {
+			functionBuilder.parameters.push({
+				sourceName: parent.getChildAtIndex(2).getText(),
+				type: getTypeInfo(parent, parent.getSymbol()?.getTypeAtLocation(parent.getParent())),
+			});
+		}
+	} else if (
+		parent.isKind(SyntaxKind.BinaryExpression) ||
+		identifier
+			.getSymbol()
+			?.getDeclarations()
+			.some((d) => d.isKind(SyntaxKind.BindingElement))
+	) {
+		functionBuilder.parameters.push({
+			sourceName: identifier.getText(),
+			type: getTypeInfo(identifier, identifier.getSymbol()?.getTypeAtLocation(identifier.getParent())),
 		});
+	}
 }
 
 function analyzeVariableDeclarations(nodeContext: NodeContext, functionBuilder: StyleFunctionBuilder, context: FileContext) {
@@ -461,7 +411,6 @@ function analyzeVariableDeclarations(nodeContext: NodeContext, functionBuilder: 
 					pass: ManipulationPass.AfterStyleGeneration,
 				});
 			} else {
-				functionBuilder.injectAfter(declaration);
 				functionBuilder.parameters.push({
 					sourceName: identifier.getText(),
 					type: getTypeInfo(identifier),
@@ -517,7 +466,7 @@ type IdentifierAnalyzer = (nodeContext: NodeContext, functionBuilder: StyleFunct
 const analyzers: IdentifierAnalyzer[] = [analyzeImports, analyzeProperties, analyzeVariableDeclarations, analyzeClassVarianceAuthority];
 
 function analyzeAttribute(attribute: JsxAttribute, functionBuilder: StyleFunctionBuilder, context: FileContext) {
-	const childIdentifiers = attribute.getDescendantsOfKind(SyntaxKind.Identifier);
+	const childIdentifiers = attribute.getDescendantsOfKind(SyntaxKind.Identifier).slice(1);
 	analyzers.forEach((analyzer) => {
 		childIdentifiers.forEach((identifier) => {
 			const nodeContext: NodeContext = { attribute, identifier };
@@ -526,17 +475,17 @@ function analyzeAttribute(attribute: JsxAttribute, functionBuilder: StyleFunctio
 	});
 }
 
-function getStyleFunctionName(jsxElement: JsxBeginElement): { name: string; rootFunction: ArrowFunction | FunctionDeclaration } {
+function getRootFunction(jsxElement: JsxBeginElement): { name: string; rootFunction: ArrowFunction | FunctionDeclaration } {
 	const rootFunction = jsxElement
 		.getAncestors()
 		.filter((a) => a.isKind(SyntaxKind.ArrowFunction) || a.isKind(SyntaxKind.FunctionDeclaration))
 		.reverse()[0];
 	if (rootFunction.isKind(SyntaxKind.FunctionDeclaration)) {
-		return { name: `${rootFunction.getName()}Styles`, rootFunction };
+		return { name: `${rootFunction.getName()}`, rootFunction };
 	}
 	const variableDeclaration = rootFunction.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
 	if (variableDeclaration) {
-		return { name: `${variableDeclaration.getName()}Styles`, rootFunction };
+		return { name: `${variableDeclaration.getName()}`, rootFunction };
 	}
 	throw Error("Could not determine style function name.");
 }
@@ -558,7 +507,6 @@ function getGroupName(jsxElement: JsxBeginElement) {
 		.getAncestors()
 		.filter((a) => a.isKind(SyntaxKind.JsxElement))
 		.map((e) => e.getOpeningElement())
-
 		.map((element) => {
 			const idAttr = getLiteralTextFromAttribute(element.getAttribute("id"));
 			if (idAttr) {
@@ -570,7 +518,9 @@ function getGroupName(jsxElement: JsxBeginElement) {
 			}
 			return element.getTagNameNode().getText();
 		})
-		.join(":");
+		.filter((n) => !n.endsWith("Provider"))
+		.reverse()
+		.join(" ");
 }
 
 export async function processSource({
@@ -603,11 +553,9 @@ export async function processSource({
 	];
 
 	jsxElements.forEach((jsxElement) => {
-		const { name: styleFunctionName, rootFunction } = getStyleFunctionName(jsxElement);
-		const functionBuilder = styleBuilder.style.getFunction(styleFunctionName, rootFunction);
-		const styleGroup = functionBuilder.createGroup(jsxElement);
-
-		console.log(`${style} - ${componentName} - ${jsxElement.getTagNameNode().getText()} attr`);
+		const { name: rootFunctionName, rootFunction } = getRootFunction(jsxElement);
+		const functionName = toValidFunctionName(`${rootFunctionName} ${getGroupName(jsxElement)} Styling`);
+		const functionBuilder = styleBuilder.style.getFunction(functionName, rootFunction, true);
 
 		let addStyleProp = false;
 		styleAttributes.forEach((styleAttribute) => {
@@ -619,7 +567,7 @@ export async function processSource({
 					addStyleProp = true;
 					context.styleBuilder.manipulations.push({
 						action: () => {
-							styleGroup.properties[attribute.getName()] = () => initializer.getText();
+							functionBuilder.properties[attribute.getName()] = () => initializer.getText();
 						},
 						pass: ManipulationPass.BeforeStyleGeneration,
 					});
@@ -638,7 +586,7 @@ export async function processSource({
 				action: () => {
 					jsxElement.insertAttribute(0, {
 						kind: StructureKind.JsxSpreadAttribute,
-						expression: `styles["${styleGroup.name}"]`,
+						expression: callGetStyles(functionBuilder),
 					});
 				},
 				pass: ManipulationPass.AfterStyleGeneration,
@@ -694,23 +642,7 @@ function cleanupBuilder(styleBuilder: StyleFileBuilder): StyleFileBuilder {
 		...styleBuilder,
 		style: {
 			...styleBuilder.style,
-			functions: styleBuilder.style.functions
-				.map((f) => {
-					const modifiedFunc = {
-						...f,
-						groups: f.groups.filter((g) => {
-							if (Object.entries(g.properties).length === 0) {
-								return false;
-							}
-							return true;
-						}),
-					};
-					if (modifiedFunc.groups.length === 0) {
-						return null;
-					}
-					return modifiedFunc;
-				})
-				.filter((f) => f !== null),
+			functions: styleBuilder.style.functions.filter((f) => Object.entries(f.properties).length > 0),
 		},
 	};
 }
@@ -731,10 +663,6 @@ async function saveResults({
 	createStyleObject(styleSource, styleBuilder);
 
 	styleBuilder.runManipulations(ManipulationPass.AfterStyleGeneration);
-	styleBuilder.style.functions.forEach((functionBuilder) => {
-		inject(functionBuilder);
-	});
-
 	removeUnusedImports(source);
 	const copiedFile = source.copy(path.join(cwd, "registry", "ui", `${componentName}.tsx`), { overwrite: true });
 	await Promise.all([copiedFile.save(), styleSource.save()]);
@@ -828,4 +756,71 @@ function groupBy<T>(arr: T[], key: (t: T) => string): { [key: string]: T[] } {
 		}
 		return acc;
 	}, {} as { [key: string]: T[] });
+}
+
+function toValidFunctionName(input: string) {
+	if (typeof input !== "string" || !input.trim()) {
+		throw new Error("Input must be a non-empty string.");
+	}
+
+	// Remove invalid characters and trim leading/trailing spaces
+	let sanitized = input.trim().replace(/[^a-zA-Z0-9_$]/g, " ");
+
+	// Convert to camelCase
+	sanitized = sanitized
+		.split(/\s+/)
+		.map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+		.join("");
+
+	// Ensure the first character is a valid identifier start
+	if (!/^[a-zA-Z_$]/.test(sanitized)) {
+		sanitized = "_" + sanitized;
+	}
+
+	// Check if it's a reserved keyword and append a suffix if necessary
+	const reservedWords = new Set([
+		"break",
+		"case",
+		"catch",
+		"class",
+		"const",
+		"continue",
+		"debugger",
+		"default",
+		"delete",
+		"do",
+		"else",
+		"enum",
+		"export",
+		"extends",
+		"false",
+		"finally",
+		"for",
+		"function",
+		"if",
+		"import",
+		"in",
+		"instanceof",
+		"new",
+		"null",
+		"return",
+		"super",
+		"switch",
+		"this",
+		"throw",
+		"true",
+		"try",
+		"typeof",
+		"var",
+		"void",
+		"while",
+		"with",
+		"yield",
+	]);
+
+	if (reservedWords.has(sanitized)) {
+		sanitized += "_fn";
+	}
+
+	return sanitized;
 }
